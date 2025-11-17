@@ -1,15 +1,11 @@
-import streamlit as st
+import snowflake.connector
 import pandas as pd
 import numpy as np
-import snowflake.connector
-
+import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-
 
 # -----------------------------------------------------------------------------
-# 0. STREAMLIT PAGE CONFIG
+# 0. PAGE CONFIG
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Snowflake KPI Dashboard",
@@ -17,20 +13,19 @@ st.set_page_config(
 )
 
 st.title("Snowflake KPI Dashboard")
-st.caption("Customers · Revenue · Channels · Funnel (Snowflake, filtered)")
+st.caption("Customers · Revenue · Channels · Funnel (Snowflake, Filtered)")
 
+st.markdown(
+    "<div style='font-size:12px; margin-bottom:10px;'>Built by "
+    "<b>Solomon Tarfasa</b> · Streamlit + Snowflake</div>",
+    unsafe_allow_html=True,
+)
 
 # -----------------------------------------------------------------------------
-# 1. SNOWFLAKE CONNECTION HELPERS
+# 1. SNOWFLAKE CONNECTION + HELPERS  (uses Streamlit secrets)
 # -----------------------------------------------------------------------------
-import streamlit as st
-import snowflake.connector
 
 def get_connection():
-    """
-    Create a Snowflake connection using Streamlit secrets.
-    In local dev, you can also create a .streamlit/secrets.toml file.
-    """
     return snowflake.connector.connect(
         account=st.secrets["SNOWFLAKE_ACCOUNT"],
         user=st.secrets["SNOWFLAKE_USER"],
@@ -42,11 +37,7 @@ def get_connection():
     )
 
 
-
 def run_query(sql: str) -> pd.DataFrame:
-    """
-    Run a SQL query in Snowflake and return a pandas DataFrame.
-    """
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -59,9 +50,9 @@ def run_query(sql: str) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# 2. LOAD DATA (CACHED)
+# 2. LOAD BASE DATA (CACHED)
 # -----------------------------------------------------------------------------
-@st.cache_data(show_spinner="Loading data from Snowflake...")
+@st.cache_data(show_spinner=True)
 def load_data():
     df_users = run_query(
         """
@@ -110,30 +101,25 @@ def load_data():
         """
     )
 
-    # Ensure datetime types
-    if not pd.api.types.is_datetime64_any_dtype(df_orders["ORDER_TS"]):
-        df_orders["ORDER_TS"] = pd.to_datetime(df_orders["ORDER_TS"])
-
-    if not pd.api.types.is_datetime64_any_dtype(df_oi["ORDER_TS"]):
-        df_oi["ORDER_TS"] = pd.to_datetime(df_oi["ORDER_TS"])
-
-    if not df_events.empty and not pd.api.types.is_datetime64_any_dtype(df_events["TS"]):
-        df_events["TS"] = pd.to_datetime(df_events["TS"])
+    # ensure datetimes
+    df_orders["ORDER_TS"] = pd.to_datetime(df_orders["ORDER_TS"])
+    df_oi["ORDER_TS"] = pd.to_datetime(df_oi["ORDER_TS"])
+    df_events["TS"] = pd.to_datetime(df_events["TS"])
 
     return df_users, df_orders, df_oi, df_events
 
 
-df_users, df_orders, df_oi, df_events = load_data()
-
+with st.spinner("Loading data from Snowflake..."):
+    df_users, df_orders, df_oi, df_events = load_data()
 
 # -----------------------------------------------------------------------------
-# 3. SIDEBAR FILTERS (DATE RANGE + COUNTRY)
+# 3. FILTERS (SIDEBAR)
 # -----------------------------------------------------------------------------
 st.sidebar.header("Filters")
 
-# Date range from orders table
-min_date = df_orders["ORDER_TS"].min().date()
-max_date = df_orders["ORDER_TS"].max().date()
+# Date range filter from orders
+min_date = df_orders["ORDER_TS"].dt.date.min()
+max_date = df_orders["ORDER_TS"].dt.date.max()
 
 date_range = st.sidebar.date_input(
     "Order date range",
@@ -142,161 +128,97 @@ date_range = st.sidebar.date_input(
     max_value=max_date,
 )
 
-# `st.date_input` can return a single date or a tuple
-if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+if isinstance(date_range, tuple):
     start_date, end_date = date_range
 else:
-    start_date, end_date = min_date, max_date
+    # if user selects a single date
+    start_date = date_range
+    end_date = date_range
 
 # Country filter
-all_countries = sorted(df_users["COUNTRY"].dropna().unique().tolist())
+all_countries = sorted(df_users["COUNTRY"].dropna().unique())
 selected_countries = st.sidebar.multiselect(
     "Countries",
-    options=all_countries,
+    all_countries,
     default=all_countries,
 )
 
-st.sidebar.markdown("---")
+# Menu for which chart to show
 view = st.sidebar.radio(
     "View",
-    ["Users by Country", "Monthly Revenue & Units", "Channel Performance", "Funnel Conversion"],
+    [
+        "Users by Country",
+        "Monthly Revenue & Units",
+        "Channel Performance",
+        "Funnel Conversion",
+    ],
 )
-
 
 # -----------------------------------------------------------------------------
 # 4. APPLY FILTERS TO DATA
 # -----------------------------------------------------------------------------
-def apply_filters(
-    df_users: pd.DataFrame,
-    df_orders: pd.DataFrame,
-    df_oi: pd.DataFrame,
-    df_events: pd.DataFrame,
-    start_date,
-    end_date,
-    selected_countries,
-):
-    # Users: filter only by country (users are "static")
-    users_f = df_users.copy()
-    if selected_countries and len(selected_countries) != len(all_countries):
-        users_f = users_f[users_f["COUNTRY"].isin(selected_countries)]
+# Filter users by country
+if selected_countries:
+    df_users_f = df_users[df_users["COUNTRY"].isin(selected_countries)].copy()
+else:
+    df_users_f = df_users.copy()
 
-    # Orders: filter by date, then by country via user
-    orders_f = df_orders.copy()
-    orders_f = orders_f[
-        (orders_f["ORDER_TS"].dt.date >= start_date)
-        & (orders_f["ORDER_TS"].dt.date <= end_date)
-    ]
-
-    orders_f = orders_f.merge(
-        df_users[["USER_ID", "COUNTRY"]],
-        on="USER_ID",
-        how="left",
-    )
-
-    if selected_countries and len(selected_countries) != len(all_countries):
-        orders_f = orders_f[orders_f["COUNTRY"].isin(selected_countries)]
-
-    # Order items: filter by date, then tie to orders/country
-    oi_f = df_oi.copy()
-    oi_f = oi_f[
-        (oi_f["ORDER_TS"].dt.date >= start_date)
-        & (oi_f["ORDER_TS"].dt.date <= end_date)
-    ]
-
-    # Join to orders to attach COUNTRY
-    oi_f = oi_f.merge(
-        orders_f[["ORDER_ID", "USER_ID", "COUNTRY"]].drop_duplicates(),
-        on="ORDER_ID",
-        how="inner",
-    )
-
-    # Events: filter by date and country
-    ev_f = df_events.copy()
-    if not ev_f.empty:
-        ev_f = ev_f[
-            (ev_f["TS"].dt.date >= start_date)
-            & (ev_f["TS"].dt.date <= end_date)
-        ]
-        ev_f = ev_f.merge(
-            df_users[["USER_ID", "COUNTRY"]],
-            on="USER_ID",
-            how="left",
-        )
-        if selected_countries and len(selected_countries) != len(all_countries):
-            ev_f = ev_f[ev_f["COUNTRY"].isin(selected_countries)]
-
-    return users_f, orders_f, oi_f, ev_f
-
-
-users_f, orders_f, oi_f, events_f = apply_filters(
-    df_users, df_orders, df_oi, df_events, start_date, end_date, selected_countries
+# Filter orders (paid + date + users)
+mask_orders = (
+    (df_orders["STATUS"] == "PAID")
+    & (df_orders["ORDER_TS"].dt.date >= start_date)
+    & (df_orders["ORDER_TS"].dt.date <= end_date)
 )
+df_orders_f = df_orders[mask_orders].copy()
 
+if not df_users_f.empty:
+    df_orders_f = df_orders_f[df_orders_f["USER_ID"].isin(df_users_f["USER_ID"])]
+
+# Filter order items (paid + matching orders)
+df_oi_f = df_oi[
+    (df_oi["STATUS"] == "PAID")
+    & (df_oi["ORDER_TS"].dt.date >= start_date)
+    & (df_oi["ORDER_TS"].dt.date <= end_date)
+].copy()
+
+if not df_orders_f.empty:
+    df_oi_f = df_oi_f[df_oi_f["ORDER_ID"].isin(df_orders_f["ORDER_ID"])]
+
+# Filter events by date + users
+df_events_f = df_events[
+    (df_events["TS"].dt.date >= start_date)
+    & (df_events["TS"].dt.date <= end_date)
+].copy()
+
+if not df_users_f.empty:
+    df_events_f = df_events_f[df_events_f["USER_ID"].isin(df_users_f["USER_ID"])]
 
 # -----------------------------------------------------------------------------
-# 5. KPI METRICS (FILTERED)
+# 5. KPIs (FILTER AWARE)
 # -----------------------------------------------------------------------------
-# Active users = users who appear in filtered orders or events
-user_ids_orders = set(orders_f["USER_ID"].dropna().unique().tolist())
-user_ids_events = set(events_f["USER_ID"].dropna().unique().tolist()) if not events_f.empty else set()
-active_user_ids = user_ids_orders.union(user_ids_events)
+total_users = df_users_f["USER_ID"].nunique()
+paid_orders = df_orders_f["ORDER_ID"].nunique()
+optin_rate = df_users_f["MARKETING_OPT_IN"].mean() if total_users > 0 else 0.0
+sessions = df_events_f["SESSION_ID"].nunique()
 
-if active_user_ids:
-    users_active = users_f[users_f["USER_ID"].isin(active_user_ids)]
-else:
-    users_active = users_f.iloc[0:0]  # empty with same columns
-
-total_users_kpi = int(len(users_active))
-
-# Paid orders (filtered)
-orders_paid_f = orders_f[orders_f["STATUS"] == "PAID"]
-paid_orders_kpi = int(orders_paid_f["ORDER_ID"].nunique())
-
-# Opt-in rate among active users (if any)
-if not users_active.empty and "MARKETING_OPT_IN" in users_active.columns:
-    optin_rate_kpi = float(users_active["MARKETING_OPT_IN"].astype(float).mean())
-else:
-    optin_rate_kpi = float("nan")
-
-# Sessions (events)
-if not events_f.empty:
-    sessions_kpi = int(events_f["SESSION_ID"].nunique())
-else:
-    sessions_kpi = 0
-
-# KPI cards
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-
-kpi1.metric("Total Users (active, filtered)", f"{total_users_kpi:,}")
-kpi2.metric("Paid Orders (filtered)", f"{paid_orders_kpi:,}")
-kpi3.metric(
-    "Opt-in Rate (active users)",
-    f"{optin_rate_kpi * 100:.1f}%" if not np.isnan(optin_rate_kpi) else "N/A",
-)
-kpi4.metric("Sessions (events, filtered)", f"{sessions_kpi:,}")
+kpi_cols = st.columns(4)
+kpi_cols[0].metric("Total Users (active, filtered)", f"{total_users:,}")
+kpi_cols[1].metric("Paid Orders (filtered)", f"{paid_orders:,}")
+kpi_cols[2].metric("Opt-in Rate (filtered)", f"{optin_rate*100:0.1f}%")
+kpi_cols[3].metric("Sessions (events, filtered)", f"{sessions:,}")
 
 st.caption(
-    "KPIs respect the selected date range and countries. "
-    "Sessions are based on FACT_EVENT; active users are those with orders or events in the filter window."
+    "KPIs respect the selected date range and country filters. "
+    "Sessions are based on FACT_EVENT within the filter window."
 )
 
-
 # -----------------------------------------------------------------------------
-# 6. PREP AGGREGATIONS FOR PLOTS (FILTERED)
+# 6. AGGREGATIONS FOR CHARTS (FILTERED)
 # -----------------------------------------------------------------------------
-# Country counts (active users only)
-if not users_active.empty:
-    country_counts = (
-        users_active["COUNTRY"].value_counts().sort_values(ascending=False)
-    )
-else:
-    country_counts = pd.Series(dtype=int)
-
-# Daily & monthly revenue/units from paid orders/items
-if not orders_paid_f.empty:
+# Monthly revenue & units
+if not df_orders_f.empty:
     daily_orders = (
-        orders_paid_f
-        .assign(DAY=orders_paid_f["ORDER_TS"].dt.date)
+        df_orders_f.assign(DAY=df_orders_f["ORDER_TS"].dt.date)
         .groupby("DAY", as_index=False)
         .agg(
             ORDERS=("ORDER_ID", "nunique"),
@@ -306,11 +228,9 @@ if not orders_paid_f.empty:
 else:
     daily_orders = pd.DataFrame(columns=["DAY", "ORDERS", "REVENUE"])
 
-if not oi_f.empty:
-    oi_paid_f = oi_f[oi_f["STATUS"] == "PAID"].copy()
+if not df_oi_f.empty:
     daily_units = (
-        oi_paid_f
-        .assign(DAY=oi_paid_f["ORDER_TS"].dt.date)
+        df_oi_f.assign(DAY=df_oi_f["ORDER_TS"].dt.date)
         .groupby("DAY", as_index=False)["QTY"]
         .sum()
         .rename(columns={"QTY": "UNITS"})
@@ -322,8 +242,7 @@ df_daily = daily_orders.merge(daily_units, on="DAY", how="left").fillna({"UNITS"
 
 if not df_daily.empty:
     df_monthly = (
-        df_daily
-        .assign(
+        df_daily.assign(
             MONTH=pd.to_datetime(df_daily["DAY"]).dt.to_period("M").dt.to_timestamp()
         )
         .groupby("MONTH", as_index=False)
@@ -336,45 +255,37 @@ if not df_daily.empty:
 else:
     df_monthly = pd.DataFrame(columns=["MONTH", "ORDERS", "REVENUE", "UNITS"])
 
+# Country counts (filtered users)
+country_counts = (
+    df_users_f["COUNTRY"].value_counts().rename_axis("COUNTRY").reset_index(name="USERS")
+)
 
-# Channel performance (paid only)
-if not oi_f.empty:
+# Channel performance
+if not df_oi_f.empty:
     channel_perf = (
-        oi_paid_f
-        .groupby("CHANNEL", as_index=False)
+        df_oi_f.groupby("CHANNEL", as_index=False)
         .agg(
             ORDERS=("ORDER_ID", "nunique"),
             UNITS=("QTY", "sum"),
             REVENUE=("LINE_AMOUNT", "sum"),
         )
+        .assign(AVG_ORDER_VALUE=lambda d: d["REVENUE"] / d["ORDERS"])
     )
-    # Average order value per channel
-    channel_perf["AVG_ORDER_VALUE"] = np.where(
-        channel_perf["ORDERS"] > 0,
-        channel_perf["REVENUE"] / channel_perf["ORDERS"],
-        0.0,
-    )
-    # Sort by revenue for nicer plot
-    channel_perf = channel_perf.sort_values("REVENUE", ascending=False)
 else:
-    channel_perf = pd.DataFrame(columns=["CHANNEL", "ORDERS", "UNITS", "REVENUE", "AVG_ORDER_VALUE"])
+    channel_perf = pd.DataFrame(
+        columns=["CHANNEL", "ORDERS", "UNITS", "REVENUE", "AVG_ORDER_VALUE"]
+    )
 
-
-# Funnel metrics (from events_f)
-monthly_funnel = pd.DataFrame()
-total_sessions_funnel = 0
-with_pv = with_atc = with_purchase = 0
-pv_to_atc = atc_to_purchase = 0.0
-
-if not events_f.empty and events_f["SESSION_ID"].notna().any():
-    ev_simple = (
-        events_f[events_f["SESSION_ID"].notna()]
-        .groupby(["USER_ID", "SESSION_ID", "EVENT_TYPE"], as_index=False)
+# Funnel: PV -> ATC -> Purchase
+if not df_events_f.empty:
+    ev_sessions = (
+        df_events_f[df_events_f["SESSION_ID"].notna()]
+        .groupby(["SESSION_ID", "EVENT_TYPE"], as_index=False)
         .agg(TS=("TS", "min"))
     )
 
     wide = (
-        ev_simple.pivot_table(
+        ev_sessions.pivot_table(
             index="SESSION_ID",
             columns="EVENT_TYPE",
             values="TS",
@@ -388,18 +299,18 @@ if not events_f.empty and events_f["SESSION_ID"].notna().any():
     wide["HAS_ATC"] = wide.get("add_to_cart").notna()
     wide["HAS_PUR"] = wide.get("purchase").notna()
 
-    total_sessions_funnel = len(wide)
-    with_pv = int(wide["HAS_PV"].sum())
-    with_atc = int(wide["HAS_ATC"].sum())
-    with_purchase = int(wide["HAS_PUR"].sum())
+    total_sessions_f = len(wide)
+    with_pv = wide["HAS_PV"].sum()
+    with_atc = wide["HAS_ATC"].sum()
+    with_purchase = wide["HAS_PUR"].sum()
 
     pv_to_atc = with_atc / with_pv if with_pv else 0.0
     atc_to_purchase = with_purchase / with_atc if with_atc else 0.0
 
-    # Daily funnel aggregation
-    ev_daily = events_f[events_f["SESSION_ID"].notna()].copy()
-    ev_daily = ev_daily.assign(DAY=ev_daily["TS"].dt.date)
-
+    # daily funnel (for rates over time)
+    ev_daily = df_events_f[df_events_f["SESSION_ID"].notna()].assign(
+        DAY=df_events_f["TS"].dt.date
+    )
     sess_daily = (
         ev_daily.groupby("SESSION_ID")
         .agg(
@@ -408,227 +319,195 @@ if not events_f.empty and events_f["SESSION_ID"].notna().any():
         )
         .reset_index()
     )
-
     sess_daily["HAS_PV"] = sess_daily["EVENT_SET"].apply(lambda s: "page_view" in s)
     sess_daily["HAS_ATC"] = sess_daily["EVENT_SET"].apply(lambda s: "add_to_cart" in s)
-    sess_daily["HAS_PURCHASE"] = sess_daily["EVENT_SET"].apply(lambda s: "purchase" in s)
+    sess_daily["HAS_PURCHASE"] = sess_daily["EVENT_SET"].apply(
+        lambda s: "purchase" in s
+    )
 
     daily_funnel = (
-        sess_daily
-        .groupby("DAY")
+        sess_daily.groupby("DAY")
         .agg(
             SESSIONS=("SESSION_ID", "nunique"),
             PV_SESSIONS=("HAS_PV", "sum"),
             ATC_SESSIONS=("HAS_ATC", "sum"),
             PURCHASE_SESSIONS=("HAS_PURCHASE", "sum"),
-            PV_TO_ATC_SESSIONS=("HAS_PV", lambda x: ((x) & (sess_daily.loc[x.index, "HAS_ATC"])).sum()),
-            ATC_TO_PURCHASE_SESSIONS=("HAS_ATC", lambda x: ((x) & (sess_daily.loc[x.index, "HAS_PURCHASE"])).sum()),
         )
         .reset_index()
     )
 
-    monthly_funnel_raw = (
-        daily_funnel
-        .assign(
-            MONTH=pd.to_datetime(daily_funnel["DAY"]).dt.to_period("M").dt.to_timestamp()
+    # monthly funnel rates
+    if not daily_funnel.empty:
+        monthly_funnel = (
+            daily_funnel.assign(
+                MONTH=pd.to_datetime(daily_funnel["DAY"])
+                .dt.to_period("M")
+                .dt.to_timestamp()
+            )
+            .groupby("MONTH", as_index=False)
+            .agg(
+                SESSIONS=("SESSIONS", "sum"),
+                PV_SESSIONS=("PV_SESSIONS", "sum"),
+                ATC_SESSIONS=("ATC_SESSIONS", "sum"),
+                PURCHASE_SESSIONS=("PURCHASE_SESSIONS", "sum"),
+            )
         )
-        .groupby("MONTH", as_index=False)
-        .agg(
-            SESSIONS=("SESSIONS", "sum"),
-            PV_SESSIONS=("PV_SESSIONS", "sum"),
-            ATC_SESSIONS=("ATC_SESSIONS", "sum"),
-            PV_TO_ATC_SESSIONS=("PV_TO_ATC_SESSIONS", "sum"),
-            ATC_TO_PURCHASE_SESSIONS=("ATC_TO_PURCHASE_SESSIONS", "sum"),
+
+        monthly_funnel["PV_TO_ATC_RATE"] = np.where(
+            monthly_funnel["PV_SESSIONS"] > 0,
+            monthly_funnel["ATC_SESSIONS"] / monthly_funnel["PV_SESSIONS"] * 100,
+            0.0,
         )
+        monthly_funnel["ATC_TO_PURCHASE_RATE"] = np.where(
+            monthly_funnel["ATC_SESSIONS"] > 0,
+            monthly_funnel["PURCHASE_SESSIONS"] / monthly_funnel["ATC_SESSIONS"] * 100,
+            0.0,
+        )
+    else:
+        monthly_funnel = pd.DataFrame(
+            columns=[
+                "MONTH",
+                "SESSIONS",
+                "PV_SESSIONS",
+                "ATC_SESSIONS",
+                "PURCHASE_SESSIONS",
+                "PV_TO_ATC_RATE",
+                "ATC_TO_PURCHASE_RATE",
+            ]
+        )
+else:
+    total_sessions_f = with_pv = with_atc = with_purchase = 0
+    pv_to_atc = atc_to_purchase = 0.0
+    monthly_funnel = pd.DataFrame(
+        columns=[
+            "MONTH",
+            "SESSIONS",
+            "PV_SESSIONS",
+            "ATC_SESSIONS",
+            "PURCHASE_SESSIONS",
+            "PV_TO_ATC_RATE",
+            "ATC_TO_PURCHASE_RATE",
+        ]
     )
-
-    monthly_funnel = monthly_funnel_raw.copy()
-    monthly_funnel["PV_TO_ATC_RATE"] = np.where(
-        monthly_funnel["PV_SESSIONS"] > 0,
-        monthly_funnel["PV_TO_ATC_SESSIONS"] / monthly_funnel["PV_SESSIONS"] * 100,
-        0.0,
-    )
-
-    monthly_funnel["ATC_TO_PURCHASE_RATE"] = np.where(
-        monthly_funnel["ATC_SESSIONS"] > 0,
-        monthly_funnel["ATC_TO_PURCHASE_SESSIONS"] / monthly_funnel["ATC_SESSIONS"] * 100,
-        0.0,
-    )
-
 
 # -----------------------------------------------------------------------------
-# 7. PLOTS – ONE PER VIEW (PLOTLY WITH HOVER)
+# 7. MAIN VIEW (ONE PLOT PER MENU ITEM)
 # -----------------------------------------------------------------------------
 st.markdown("---")
 
 if view == "Users by Country":
-    st.subheader("Users by Country (Active, Filtered)")
+    st.subheader("Users by Country (Filtered)")
 
-    if country_counts.empty:
-        st.info("No active users for the current filters.")
-    else:
-        fig = px.bar(
-            x=country_counts.index,
-            y=country_counts.values,
-            labels={"x": "Country", "y": "Number of Users"},
+    if not country_counts.empty:
+        fig_country = px.bar(
+            country_counts,
+            x="COUNTRY",
+            y="USERS",
             title="Users by Country",
-            hover_name=country_counts.index,
+            labels={"USERS": "Number of Users"},
         )
+        st.plotly_chart(fig_country, use_container_width=True)
+    else:
+        st.info("No users for the selected filters.")
 
-        fig.update_layout(
-            template="plotly_white",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
+    # download
+    csv_ctry = country_counts.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download country breakdown (CSV)",
+        csv_ctry,
+        "users_by_country.csv",
+        "text/csv",
+    )
 
 elif view == "Monthly Revenue & Units":
     st.subheader("Monthly Revenue & Units (Paid Orders, Filtered)")
 
-    if df_monthly.empty:
-        st.info("No monthly data available for the current filters.")
+    if not df_monthly.empty:
+        df_melt = df_monthly.melt(
+            id_vars="MONTH",
+            value_vars=["REVENUE", "UNITS"],
+            var_name="Metric",
+            value_name="Value",
+        )
+        fig_month = px.line(
+            df_melt,
+            x="MONTH",
+            y="Value",
+            color="Metric",
+            markers=True,
+            title="Monthly Revenue & Units (Paid Orders, Filtered)",
+        )
+        st.plotly_chart(fig_month, use_container_width=True)
     else:
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        st.info("No paid orders for the selected filters.")
 
-        # Revenue
-        fig.add_trace(
-            go.Scatter(
-                x=df_monthly["MONTH"],
-                y=df_monthly["REVENUE"],
-                mode="lines+markers",
-                name="Revenue",
-                hovertemplate="Month: %{x|%Y-%m}<br>Revenue: %{y:,.2f}<extra></extra>",
-            ),
-            secondary_y=False,
-        )
-
-        # Units
-        fig.add_trace(
-            go.Scatter(
-                x=df_monthly["MONTH"],
-                y=df_monthly["UNITS"],
-                mode="lines+markers",
-                name="Units Sold",
-                line=dict(dash="dash"),
-                hovertemplate="Month: %{x|%Y-%m}<br>Units: %{y:,.0f}<extra></extra>",
-            ),
-            secondary_y=True,
-        )
-
-        fig.update_xaxes(title_text="Month")
-        fig.update_yaxes(title_text="Revenue", secondary_y=False)
-        fig.update_yaxes(title_text="Units Sold", secondary_y=True)
-
-        fig.update_layout(
-            template="plotly_white",
-            title_text="Monthly Revenue & Units (Paid Orders, Filtered)",
-            hovermode="x unified",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
+    csv_month = df_monthly.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download monthly revenue & units (CSV)",
+        csv_month,
+        "monthly_revenue_units.csv",
+        "text/csv",
+    )
 
 elif view == "Channel Performance":
     st.subheader("Channel Performance (Paid Orders, Filtered)")
 
-    if channel_perf.empty:
-        st.info("No channel data available for the current filters.")
+    if not channel_perf.empty:
+        fig_channel = px.bar(
+            channel_perf,
+            x="CHANNEL",
+            y="REVENUE",
+            color="CHANNEL",
+            title="Revenue by Channel (Paid Orders, Filtered)",
+            hover_data=["ORDERS", "UNITS", "AVG_ORDER_VALUE"],
+        )
+        st.plotly_chart(fig_channel, use_container_width=True)
     else:
-        fig = go.Figure()
+        st.info("No channel data for the selected filters.")
 
-        fig.add_trace(
-            go.Bar(
-                x=channel_perf["CHANNEL"],
-                y=channel_perf["REVENUE"],
-                name="Revenue (Paid Orders)",
-                hovertemplate=(
-                    "Channel: %{x}<br>"
-                    "Revenue: %{y:,.2f}<br>"
-                    "Orders: %{customdata[0]}<br>"
-                    "Units: %{customdata[1]:,.0f}<br>"
-                    "AOV (Revenue/Order): %{customdata[2]:,.2f}<extra></extra>"
-                ),
-                customdata=np.stack(
-                    [
-                        channel_perf["ORDERS"],
-                        channel_perf["UNITS"],
-                        channel_perf["AVG_ORDER_VALUE"],
-                    ],
-                    axis=-1,
-                ),
-            )
-        )
-
-        fig.update_layout(
-            template="plotly_white",
-            title="Channel Revenue & Volume (Paid Orders, Filtered)",
-            xaxis_title="Channel",
-            yaxis_title="Revenue",
-            margin=dict(l=40, r=20, t=60, b=40),
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
+    csv_ch = channel_perf.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download channel performance (CSV)",
+        csv_ch,
+        "channel_performance.csv",
+        "text/csv",
+    )
 
 elif view == "Funnel Conversion":
-    st.subheader("Monthly Funnel Conversion Rates (Filtered Events)")
+    st.subheader("Funnel Conversion (PV → ATC → Purchase)")
 
-    if monthly_funnel.empty or total_sessions_funnel == 0:
-        st.info("No funnel data available for the current filters.")
-    else:
-        fig = go.Figure()
+    col_l, col_r = st.columns([2, 1])
 
-        fig.add_trace(
-            go.Scatter(
-                x=monthly_funnel["MONTH"],
-                y=monthly_funnel["PV_TO_ATC_RATE"],
-                mode="lines+markers",
-                name="PV → ATC (%)",
-                hovertemplate="Month: %{x|%Y-%m}<br>PV → ATC: %{y:.1f}%<extra></extra>",
+    with col_l:
+        if not monthly_funnel.empty:
+            fig_funnel = px.line(
+                monthly_funnel,
+                x="MONTH",
+                y=["PV_TO_ATC_RATE", "ATC_TO_PURCHASE_RATE"],
+                markers=True,
+                labels={
+                    "value": "Conversion Rate (%)",
+                    "variable": "Stage",
+                },
+                title="Monthly Funnel Conversion Rates (Filtered)",
             )
-        )
+            st.plotly_chart(fig_funnel, use_container_width=True)
+        else:
+            st.info("No funnel events for the selected filters.")
 
-        fig.add_trace(
-            go.Scatter(
-                x=monthly_funnel["MONTH"],
-                y=monthly_funnel["ATC_TO_PURCHASE_RATE"],
-                mode="lines+markers",
-                name="ATC → Purchase (%)",
-                hovertemplate="Month: %{x|%Y-%m}<br>ATC → Purchase: %{y:.1f}%<extra></extra>",
-            )
-        )
+    with col_r:
+        st.markdown("**Overall Funnel (Filtered)**")
+        st.write(f"Sessions: **{total_sessions_f:,}**")
+        st.write(f"Sessions with page view: **{with_pv:,}**")
+        st.write(f"Sessions with add-to-cart: **{with_atc:,}**")
+        st.write(f"Sessions with purchase: **{with_purchase:,}**")
+        st.write(f"PV → ATC: **{pv_to_atc*100:0.1f}%**")
+        st.write(f"ATC → Purchase: **{atc_to_purchase*100:0.1f}%**")
 
-        summary_text = (
-            f"Sessions: {total_sessions_funnel}<br>"
-            f"PV: {with_pv} · ATC: {with_atc} · PUR: {with_purchase}<br>"
-            f"PV→ATC (overall): {pv_to_atc * 100:.1f}%<br>"
-            f"ATC→PUR (overall): {atc_to_purchase * 100:.1f}%"
+        csv_f = monthly_funnel.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download monthly funnel stats (CSV)",
+            csv_f,
+            "monthly_funnel.csv",
+            "text/csv",
         )
-
-        fig.update_layout(
-            template="plotly_white",
-            title="Monthly Funnel Conversion Rates (Filtered Events)",
-            xaxis_title="Month",
-            yaxis_title="Conversion Rate (%)",
-            hovermode="x unified",
-            margin=dict(l=40, r=20, t=60, b=40),
-            annotations=[
-                dict(
-                    xref="paper",
-                    yref="paper",
-                    x=0.01,
-                    y=0.99,
-                    text=summary_text,
-                    showarrow=False,
-                    align="left",
-                    bordercolor="rgba(0,0,0,0.2)",
-                    borderwidth=1,
-                    bgcolor="rgba(255,255,255,0.85)",
-                    font=dict(size=10),
-                )
-            ],
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
